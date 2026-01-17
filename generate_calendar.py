@@ -231,122 +231,114 @@ def add_static_gtwc_europe_2026(events: list[str]) -> None:
 # UFC auto-updating (ESPN)
 # -----------------------------
 
-@dataclass
-class UFCEvent:
-    name: str
-    start_et: datetime        # naive ET local datetime (we label it as America/New_York in ICS)
-    location: str
+from zoneinfo import ZoneInfo
 
-def _walk(obj: Any) -> Iterable[Any]:
-    """Yield all nested values (dicts/lists/scalars) for heuristic searching."""
-    if isinstance(obj, dict):
-        yield obj
-        for v in obj.values():
-            yield from _walk(v)
-    elif isinstance(obj, list):
-        yield obj
-        for v in obj:
-            yield from _walk(v)
-
-def fetch_ufc_events_from_espn(max_events: int = 200) -> list[UFCEvent]:
+def fetch_ufc_events_from_espn_table(max_events: int = 200):
     """
-    Pull UFC events from ESPN UFC schedule page.
-    ESPN pages often include a JSON blob in <script id="__NEXT_DATA__">.
-    If that structure changes, this may need tweaking.
-
-    Source schedule page: :contentReference[oaicite:5]{index=5}
+    Scrape the visible UFC schedule table from ESPN.
+    ESPN shows times in ET on the page. :contentReference[oaicite:2]{index=2}
     """
     url = "https://www.espn.com/mma/schedule/_/league/ufc"
-    html = requests.get(url, timeout=30).text
+    html = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"}).text
 
-    # Try Next.js JSON first
-    m = re.search(r'<script[^>]+id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.S)
-    if not m:
-        return []
+    # Example row text patterns on page:
+    # "Jan 24 5:00 PM" then "UFC 324: ..." then "T-Mobile Arena, Las Vegas, NV"
+    # We'll capture blocks containing Month Day, Time, Event, Location.
+    # This regex is intentionally forgiving.
+    row_re = re.compile(
+        r'([A-Z][a-z]{2})\s+(\d{1,2})\s*.*?(\d{1,2}:\d{2}\s*[AP]M).*?'
+        r'(UFC[^<\n\r]+).*?'
+        r'([A-Za-z0-9].{5,120}?)\s*(?:</td>|</tr>)',
+        re.S
+    )
 
-    data = json.loads(m.group(1))
+    month_map = {m: i for i, m in enumerate(
+        ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"], start=1
+    )}
 
-    # Heuristic: look for dicts that smell like "event rows"
-    found: list[UFCEvent] = []
-    now = datetime.now()
+    et = ZoneInfo("America/New_York")
+    now_et = datetime.now(et)
 
-    for node in _walk(data):
-        if not isinstance(node, dict):
-            continue
-
-        # Common keys observed across ESPN pages: "name", "date", "location"
-        # We accept a few variants, because ESPN structures vary.
-        name = node.get("name") or node.get("shortName") or node.get("description")
-        dt_str = node.get("date") or node.get("startDate") or node.get("startTime")
-        loc = node.get("location") or node.get("venue") or ""
-
-        if not (isinstance(name, str) and isinstance(dt_str, str)):
-            continue
-
-        # Filter to UFC only: require "UFC" in name somewhere.
-        if "UFC" not in name:
-            continue
-
-        # Parse datetime: ESPN often uses ISO like "2026-02-28T19:00Z" or with offset.
+    out = []
+    for mo, day, time_str, event_name, location in row_re.findall(html):
         try:
-            # Python 3.11+ supports fromisoformat with offsets; handle trailing Z.
-            iso = dt_str.replace("Z", "+00:00")
-            dt_utc = datetime.fromisoformat(iso)
+            year = now_et.year  # page is "2026 season" right now, but keep flexible
+            # If we're late in year and see Jan/Feb, it might be next year:
+            mnum = month_map.get(mo)
+            if not mnum:
+                continue
+
+            # crude rollover: if month is much earlier than current month, bump year
+            if mnum < (now_et.month - 6):
+                year += 1
+
+            dt_et = datetime.strptime(f"{year}-{mnum:02d}-{int(day):02d} {time_str.strip()}",
+                                      "%Y-%m-%d %I:%M %p").replace(tzinfo=et)
+
+            # Only keep upcoming (or very recent) events
+            if dt_et < (now_et - timedelta(days=7)):
+                continue
+
+            out.append((event_name.strip(), dt_et, location.strip()))
+            if len(out) >= max_events:
+                break
         except Exception:
             continue
 
-        # Convert UTC -> ET by subtracting offset safely without pytz:
-        # We will store as local "America/New_York" in ICS.
-        # (This is accurate enough for schedule purposes; if you want perfect DST handling,
-        # you can add zoneinfo in Python 3.9+.)
-        try:
-            from zoneinfo import ZoneInfo
-            et = ZoneInfo("America/New_York")
-            dt_et = dt_utc.astimezone(et).replace(tzinfo=None)
-        except Exception:
-            # Fallback: keep naive
-            dt_et = dt_utc.replace(tzinfo=None)
-
-        # Keep upcoming-ish (or recent) events only; avoid grabbing old historical data.
-        if dt_et < (now - timedelta(days=7)):
-            continue
-
-        # Normalize location
-        if isinstance(loc, dict):
-            loc = loc.get("fullName") or loc.get("name") or ""
-        if not isinstance(loc, str):
-            loc = ""
-
-        found.append(UFCEvent(name=name, start_et=dt_et, location=loc))
-
-        if len(found) >= max_events:
-            break
-
-    # Deduplicate by (name, start time)
+    # Deduplicate
     uniq = {}
-    for ev in found:
-        key = (ev.name.strip(), ev.start_et)
-        uniq[key] = ev
+    for name, dt_et, loc in out:
+        uniq[(name, dt_et)] = (name, dt_et, loc)
 
-    # Sort
-    out = sorted(uniq.values(), key=lambda x: x.start_et)
-    return out
+    return [uniq[k] for k in sorted(uniq.keys(), key=lambda x: x[1])]
 
+def vevent_timed_utc(summary: str, start_et: datetime, duration_hours: int = 5,
+                    location: str = "", description: str = "", categories: str = "") -> str:
+    uid = f"{uuid.uuid4()}@sports-calendar"
+    start_utc = start_et.astimezone(timezone.utc)
+    end_utc = (start_et + timedelta(hours=duration_hours)).astimezone(timezone.utc)
+
+    def fmtz(d: datetime) -> str:
+        return d.strftime("%Y%m%dT%H%M%SZ")
+
+    lines = [
+        "BEGIN:VEVENT",
+        f"UID:{uid}",
+        f"DTSTAMP:{dtstamp_utc()}",
+        f"SUMMARY:{ics_escape(summary)}",
+        f"DTSTART:{fmtz(start_utc)}",
+        f"DTEND:{fmtz(end_utc)}",
+    ]
+    if location:
+        lines.append(f"LOCATION:{ics_escape(location)}")
+    if categories:
+        lines.append(f"CATEGORIES:{ics_escape(categories)}")
+    if description:
+        lines.append(f"DESCRIPTION:{ics_escape(description)}")
+
+    lines += [
+        "BEGIN:VALARM",
+        "ACTION:DISPLAY",
+        "DESCRIPTION:Reminder",
+        "TRIGGER:-PT1H",
+        "END:VALARM",
+        "END:VEVENT",
+    ]
+    return "\n".join(lines)
 
 def add_dynamic_ufc(events: list[str]) -> None:
-    ufc_events = fetch_ufc_events_from_espn()
-    for ev in ufc_events:
+    for name, start_et, loc in fetch_ufc_events_from_espn_table():
         events.append(
-            vevent_timed(
-                summary=f"🟪 {ev.name}",
-                start_local=ev.start_et,
+            vevent_timed_utc(
+                summary=f"🟪 {name}",
+                start_et=start_et,
                 duration_hours=5,
-                tzid="America/New_York",
-                location=ev.location,
-                description="Auto-updated from ESPN UFC schedule.",
+                location=loc,
+                description="Auto-updated from ESPN UFC schedule (times shown as ET on ESPN).",
                 categories="UFC",
             )
         )
+
 
 
 # -----------------------------
